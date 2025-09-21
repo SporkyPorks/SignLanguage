@@ -114,27 +114,39 @@ def main():
                 cv2.circle(frame, chin_point, 5, (255, 0, 0), -1)  # blue dot
 
             # Check for hand near chin and downward motion
+            # Check for hand near chin and downward motion
             if chin_point and results.multi_hand_landmarks:
                 hand_landmarks = results.multi_hand_landmarks[0]
-                palm_base = hand_landmarks.landmark[0]
-                palm_x = int(palm_base.x * frame_w)
-                palm_y = int(palm_base.y * frame_h)
+                middle_finger_tip = hand_landmarks.landmark[12]
+                palm_x = int(middle_finger_tip.x * frame_w)
+                palm_y = int(middle_finger_tip.y * frame_h)
+
+
+                # Visualize palm position
+                print("📍 Drawing palm at:", palm_x, palm_y)
+                cv2.circle(frame, (palm_x, palm_y), 10, (0, 255, 0), -1)
 
                 dist = math.hypot(palm_x - chin_point[0], palm_y - chin_point[1])
                 current_time = time.time()
 
                 # Touch detected (close enough to chin)
-                if dist < 40:
+                if dist < 60:
                     chin_touch_time = current_time
                     chin_touch_y = palm_y
+                    print("✅ Chin touched: dist =", dist, "Y =", chin_touch_y)
 
                 # Check for downward motion shortly after touching
-                elif chin_touch_time and (current_time - chin_touch_time < 0.5):
+                elif chin_touch_time and (current_time - chin_touch_time < 1.0):
+                    print("⏳ Checking for downward motion...")
+                    print("   Palm Y now:", palm_y, "| Previous Y:", chin_touch_y, "| Delta:", palm_y - chin_touch_y)
+
                     if palm_y - chin_touch_y > 40 and (current_time - thankyou_cooldown > 2):
+                        print("🎉 Detected Thank you!")
                         confirmed_sign = "Thank you"
                         thankyou_cooldown = current_time
                         chin_touch_time = None
                         chin_touch_y = None
+
 
             # ---- HAND PROCESSING ----
             if results.multi_hand_landmarks:
@@ -196,9 +208,6 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-
-
-
 
 if __name__ == "__main__":
     main()
