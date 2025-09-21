@@ -1,0 +1,631 @@
+# asl_alphabet_app.py - ASL Alphabet Recognition with ML Model
+import cv2
+import mediapipe as mp
+import numpy as np
+import streamlit as st
+import time
+import pickle
+import math
+from collections import deque
+
+# Parameters
+BOX_W, BOX_H = 700, 700  # Match original detection box size
+STABILITY_FRAMES = 10
+PREDICTION_HOLD_TIME = 0.5  # Time to hold prediction before confirming
+
+# MediaPipe
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+mp_face_mesh = mp.solutions.face_mesh
+
+# ML Model variables
+model = None
+pinky_history = deque(maxlen=10)
+j_detected_time = None
+last_prediction = None
+prediction_start_time = None
+confirmed_sign = ""
+
+# History
+gesture_history = deque(maxlen=50)
+
+# Chin tracking variables for "Thank you"
+chin_touch_time = None
+chin_touch_y = None
+thankyou_cooldown = 0
+
+def load_model():
+    """Load the trained ASL model"""
+    global model
+    try:
+        with open('trained_asl_model.pkl', 'rb') as f:
+            model = pickle.load(f)
+        return True
+    except FileNotFoundError:
+        st.error("❌ trained_asl_model.pkl not found. Please ensure the model file is in the same directory.")
+        return False
+    except Exception as e:
+        st.error(f"❌ Error loading model: {str(e)}")
+        return False
+
+def landmarks_to_features(landmarks):
+    """Convert hand landmarks to feature vector"""
+    base_x = landmarks[0].x
+    base_y = landmarks[0].y
+    features = []
+    for lm in landmarks:
+        features.append(lm.x - base_x)
+        features.append(lm.y - base_y)
+    return np.array(features)
+
+def predict_sign(model, landmarks):
+    """Predict ASL sign using the trained model"""
+    if model is None:
+        return None
+    features = landmarks_to_features(landmarks).reshape(1, -1)
+    prediction = model.predict(features)
+    return prediction[0]
+
+def is_j_motion(pinky_history):
+    """Detect J motion for letter J"""
+    if len(pinky_history) < 10:
+        return False
+
+    points = np.array(pinky_history)
+    deltas = np.diff(points, axis=0)
+    
+    angles = []
+    for i in range(len(deltas) - 1):
+        v1 = deltas[i]
+        v2 = deltas[i + 1]
+        v1_norm = v1 / (np.linalg.norm(v1) + 1e-6)
+        v2_norm = v2 / (np.linalg.norm(v2) + 1e-6)
+        dot = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+        angle = np.arccos(dot)
+        angles.append(angle)
+
+    total_angle = np.sum(angles)
+    dx = points[-1][0] - points[0][0]
+    dy = points[-1][1] - points[0][1]
+
+    # Conditions for J motion: moves left and down, with a curve
+    return dx < -20 and dy > 20 and total_angle > 1.0
+
+def hand_in_box(finger_tips, box_x, box_y, box_w, box_h):
+    """Check if all fingertips are within the detection box"""
+    return all(box_x <= x <= box_x + box_w and box_y <= y <= box_y + box_h for x, y in finger_tips)
+
+# Color map for letters
+ALPHABET_COLOR_MAP = {
+    "A": "#FF6B6B", "B": "#4ECDC4", "C": "#45B7D1", "D": "#96CEB4", "E": "#FFEAA7",
+    "F": "#DDA0DD", "G": "#98D8C8", "H": "#F7DC6F", "I": "#BB8FCE", "J": "#85C1E9",
+    "K": "#F8C471", "L": "#82E0AA", "M": "#F1948A", "N": "#85C1E9", "O": "#F8D7DA",
+    "P": "#D5DBDB", "Q": "#A9DFBF", "R": "#F9E79F", "S": "#D7BDE2", "T": "#A3E4D7",
+    "U": "#FAD7A0", "V": "#FADBD8", "W": "#D6EAF8", "X": "#E8DAEF", "Y": "#FCF3CF", 
+    "Z": "#EDEDED", "Thank you": "#2196F3"
+}
+
+def run_alphabet_detection(frame_placeholder, status_placeholder, chat_placeholder,
+                          confidence_threshold, tracking_confidence):
+    """Run ASL alphabet detection using ML model"""
+    global model, pinky_history, j_detected_time, last_prediction, prediction_start_time, confirmed_sign
+    global chin_touch_time, chin_touch_y, thankyou_cooldown, gesture_history
+    
+    try:
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            status_placeholder.error("❌ Camera not detected. Please check your webcam connection.")
+            st.session_state.camera_active = False
+            return
+        
+        # Load model
+        if model is None:
+            if not load_model():
+                return
+        
+        status_placeholder.success("✅ Camera active - Make ASL letters within the green box")
+        
+        with mp_hands.Hands(
+            max_num_hands=1,
+            min_detection_confidence=confidence_threshold,
+            min_tracking_confidence=tracking_confidence
+        ) as hands, \
+        mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        ) as face_mesh:
+            
+            while st.session_state.camera_active:
+                ret, frame = cap.read()
+                if not ret:
+                    status_placeholder.warning("⚠️ Failed to read from camera")
+                    break
+
+                frame = cv2.flip(frame, 1)
+                frame_h, frame_w, _ = frame.shape
+                box_x = (frame_w - BOX_W) // 2
+                box_y = (frame_h - BOX_H) // 2
+                
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Process hands and face
+                results = hands.process(rgb_frame)
+                face_results = face_mesh.process(rgb_frame)
+                
+                raw_prediction = None
+                
+                # Face/chin tracking for "Thank you"
+                chin_point = None
+                if face_results.multi_face_landmarks:
+                    face_landmarks = face_results.multi_face_landmarks[0]
+                    chin_lm = face_landmarks.landmark[152]
+                    chin_x = int(chin_lm.x * frame_w)
+                    chin_y = int(chin_lm.y * frame_h)
+                    chin_point = (chin_x, chin_y)
+                    cv2.circle(frame, chin_point, 5, (255, 0, 0), -1)
+
+                # Process hands
+                if results.multi_hand_landmarks:
+                    hand_landmarks = results.multi_hand_landmarks[0]
+                    
+                    # Draw hand landmarks
+                    mp_drawing.draw_landmarks(
+                        frame, hand_landmarks, mp_hands.HAND_CONNECTIONS
+                    )
+                    
+                    # Track pinky for J motion
+                    pinky_tip = hand_landmarks.landmark[20]
+                    pinky_x = int(pinky_tip.x * frame_w)
+                    pinky_y = int(pinky_tip.y * frame_h)
+                    pinky_history.append((pinky_x, pinky_y))
+                    
+                    # Get finger tips
+                    finger_tips = [(int(hand_landmarks.landmark[i].x * frame_w),
+                                   int(hand_landmarks.landmark[i].y * frame_h)) 
+                                  for i in [4, 8, 12, 16, 20]]
+                    
+                    # Check if hand is inside detection box
+                    inside_box = hand_in_box(finger_tips, box_x, box_y, BOX_W, BOX_H)
+                    
+                    if inside_box:
+                        # Get ML prediction
+                        predicted = predict_sign(model, hand_landmarks.landmark)
+                        
+                        if predicted:
+                            # Check for J motion
+                            if predicted == 'I' and is_j_motion(pinky_history):
+                                raw_prediction = "J"
+                                j_detected_time = time.time()
+                            else:
+                                raw_prediction = predicted
+                    
+                    # Check for chin touch (Thank you gesture)
+                    if chin_point:
+                        middle_finger_tip = hand_landmarks.landmark[12]
+                        palm_x = int(middle_finger_tip.x * frame_w)
+                        palm_y = int(middle_finger_tip.y * frame_h)
+                        
+                        cv2.circle(frame, (palm_x, palm_y), 10, (0, 255, 0), -1)
+                        
+                        dist = math.hypot(palm_x - chin_point[0], palm_y - chin_point[1])
+                        current_time = time.time()
+                        
+                        # Touch detected
+                        if dist < 60:
+                            chin_touch_time = current_time
+                            chin_touch_y = palm_y
+                        # Check for downward motion after touch
+                        elif chin_touch_time and (current_time - chin_touch_time < 1.0):
+                            if palm_y - chin_touch_y > 40 and (current_time - thankyou_cooldown > 2):
+                                raw_prediction = "Thank you"
+                                thankyou_cooldown = current_time
+                                chin_touch_time = None
+                                chin_touch_y = None
+
+                # Stability logic for predictions
+                current_time = time.time()
+                if raw_prediction == last_prediction:
+                    if prediction_start_time is None:
+                        prediction_start_time = current_time
+                    elif current_time - prediction_start_time >= PREDICTION_HOLD_TIME:
+                        if confirmed_sign != raw_prediction:
+                            confirmed_sign = raw_prediction
+                            # Add to history
+                            if confirmed_sign != st.session_state.get('last_added_sign', ''):
+                                gesture_history.append(confirmed_sign)
+                                st.session_state.last_added_sign = confirmed_sign
+                else:
+                    prediction_start_time = current_time
+                    last_prediction = raw_prediction
+
+                # Draw detection box
+                overlay = frame.copy()
+                alpha = 0.15
+                cv2.rectangle(overlay, (box_x, box_y), (box_x + BOX_W, box_y + BOX_H), (0, 255, 0), -1)
+                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+                
+                box_color = (0, 255, 0) if confirmed_sign else (0, 0, 255)
+                cv2.rectangle(frame, (box_x, box_y), (box_x + BOX_W, box_y + BOX_H), box_color, 3)
+
+                # Display current detection
+                if confirmed_sign:
+                    cv2.putText(frame, f"Detected: {confirmed_sign}", (30, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 0), 4)
+
+                # Show J detection indicator
+                if j_detected_time and (time.time() - j_detected_time < 3):
+                    cv2.putText(frame, "J Motion Detected", (30, 120),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+                elif j_detected_time:
+                    j_detected_time = None
+
+                # Update camera feed
+                frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
+
+                # Update chat panel
+                if gesture_history:
+                    with chat_placeholder.container():
+                        st.markdown("### 🔤 Recent Signs")
+                        recent_signs = list(gesture_history)[-10:][::-1]
+                        for sign in recent_signs:
+                            color = ALPHABET_COLOR_MAP.get(sign, "#FFFFFF")
+                            st.markdown(f"""
+                            <div style='background-color: {color}; color: black; 
+                                    padding: 10px; border-radius: 10px; margin: 5px 0; 
+                                    text-align: center; font-weight: bold; font-size: 16px;'>
+                                {sign}
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                time.sleep(0.1)
+
+        cap.release()
+    
+    except Exception as e:
+        status_placeholder.error(f"❌ Error: {str(e)}")
+        st.session_state.camera_active = False
+
+def run_learning_camera(frame_placeholder, status_placeholder, feedback_placeholder,
+                         confidence_threshold, tracking_confidence):
+    """Run camera detection for learning mode with ML model"""
+    global model, pinky_history
+    
+    try:
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            status_placeholder.error("❌ Camera not detected. Please check your webcam connection.")
+            st.session_state.learning_mode['active'] = False
+            return
+        
+        # Load model
+        if model is None:
+            if not load_model():
+                return
+        
+        status_placeholder.success("✅ Learning mode active - Practice your letters!")
+        
+        with mp_hands.Hands(
+            max_num_hands=1,
+            min_detection_confidence=confidence_threshold,
+            min_tracking_confidence=tracking_confidence
+        ) as hands:
+            
+            last_detection_time = 0
+            detection_buffer = deque(maxlen=5)
+            
+            while st.session_state.learning_mode['active']:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame = cv2.flip(frame, 1)
+                frame_h, frame_w, _ = frame.shape
+                box_x = (frame_w - BOX_W) // 2
+                box_y = (frame_h - BOX_H) // 2
+                
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = hands.process(rgb_frame)
+
+                current_letter = st.session_state.learning_mode['current_letter']
+                current_time = time.time()
+                
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        mp_drawing.draw_landmarks(
+                            frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                            mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=4),
+                            mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=2)
+                        )
+                        
+                        # Track pinky for J motion
+                        pinky_tip = hand_landmarks.landmark[20]
+                        pinky_x = int(pinky_tip.x * frame_w)
+                        pinky_y = int(pinky_tip.y * frame_h)
+                        pinky_history.append((pinky_x, pinky_y))
+                        
+                        finger_tips = [(int(hand_landmarks.landmark[j].x * frame_w),
+                                       int(hand_landmarks.landmark[j].y * frame_h)) 
+                                      for j in [4, 8, 12, 16, 20]]
+                        
+                        # Check if hand is in box
+                        if hand_in_box(finger_tips, box_x, box_y, BOX_W, BOX_H):
+                            predicted_letter = predict_sign(model, hand_landmarks.landmark)
+                            
+                            # Handle J motion
+                            if predicted_letter == 'I' and is_j_motion(pinky_history):
+                                predicted_letter = 'J'
+                            
+                            if predicted_letter:
+                                detection_buffer.append(predicted_letter)
+                                
+                                # Check for stable detection
+                                if len(detection_buffer) >= 3:
+                                    most_common = max(set(detection_buffer), key=detection_buffer.count)
+                                    if detection_buffer.count(most_common) >= 3 and current_time - last_detection_time > 2:
+                                        if most_common == current_letter:
+                                            st.session_state.learning_mode['score'] += 10
+                                            st.session_state.learning_mode['completed_letters'].add(current_letter)
+                                            
+                                            feedback_placeholder.success(f"✅ Excellent! You signed '{current_letter}' correctly!")
+                                            
+                                            # Move to next letter
+                                            next_letter = chr(ord(current_letter) + 1)
+                                            if next_letter <= 'Z':
+                                                st.session_state.learning_mode['current_letter'] = next_letter
+                                            else:
+                                                feedback_placeholder.balloons()
+                                                feedback_placeholder.success("🎉 Congratulations! You've completed the entire alphabet!")
+                                                st.session_state.learning_mode['current_letter'] = 'A'
+                                            
+                                            last_detection_time = current_time
+                                            detection_buffer.clear()
+                                        else:
+                                            feedback_placeholder.warning(f"Not quite! You signed '{most_common}', but we're looking for '{current_letter}'. Try again!")
+                                            last_detection_time = current_time
+                                            detection_buffer.clear()
+                
+                # Draw detection box
+                overlay = frame.copy()
+                alpha = 0.15
+                cv2.rectangle(overlay, (box_x, box_y), (box_x + BOX_W, box_y + BOX_H), (0, 255, 0), -1)
+                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+                cv2.rectangle(frame, (box_x, box_y), (box_x + BOX_W, box_y + BOX_H), (0, 255, 0), 3)
+
+                # Display current target letter
+                cv2.putText(frame, f"Target: {current_letter}", (30, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 0), 4)
+
+                # Update camera feed
+                frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
+
+                time.sleep(0.1)
+
+        cap.release()
+    
+    except Exception as e:
+        status_placeholder.error(f"❌ Error: {str(e)}")
+        st.session_state.learning_mode['active'] = False
+
+# MAIN STREAMLIT APP
+st.set_page_config(
+    page_title="SignScribe - ASL Alphabet Recognition",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Sidebar
+with st.sidebar:
+    st.title("🔤 ASL Alphabet Recognition")
+    st.markdown("---")
+    
+    st.subheader("Supported Signs")
+    st.markdown("**Letters:** A-Z using trained ML model")
+    st.markdown("**Special:** Thank you (chin touch gesture)")
+    
+    st.markdown("---")
+    st.subheader("Instructions")
+    st.markdown("""
+    1. Click **'Start Recognition'** to begin
+    2. Position your hand within the green box
+    3. Make clear ASL letters
+    4. Watch the detection panel for results
+    5. For 'J': Make 'I' shape then curve down
+    6. For 'Thank you': Touch chin, move hand down
+    """)
+    
+    st.markdown("---")
+    st.subheader("Settings")
+    confidence_threshold = st.slider("Detection Confidence", 0.5, 1.0, 0.7, 0.1)
+    tracking_confidence = st.slider("Tracking Confidence", 0.5, 1.0, 0.5, 0.1)
+
+# Main App Header
+st.markdown("""
+<div style='text-align: center; padding: 20px 0;'>
+    <h1 style='background: linear-gradient(90deg, #4CAF50, #2196F3, #9C27B0); 
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            font-size: 3.5em; margin: 0; font-weight: bold;'>
+        🔤 SignScribe Alphabet
+    </h1>
+    <p style='font-size: 1.2em; color: #666; margin: 10px 0;'>
+        ML-powered ASL alphabet recognition
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# Tab selection
+tab1, tab2 = st.tabs(["🎮 Free Practice", "🎓 Alphabet Learning"])
+
+with tab1:
+    st.markdown("### 🎮 **Free Practice Mode**")
+    st.markdown("Practice any ASL letter A-Z and see real-time ML-based recognition")
+    
+    # Control buttons
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        run = st.button("🎥 Start Recognition", type="primary", key="main_start")
+    with col2:
+        stop = st.button("⏹️ Stop Recognition", key="main_stop")
+    with col3:
+        clear_history = st.button("🗑️ Clear History", key="main_clear")
+
+    # Initialize session state
+    if 'camera_active' not in st.session_state:
+        st.session_state.camera_active = False
+    if 'last_added_sign' not in st.session_state:
+        st.session_state.last_added_sign = ""
+
+    if clear_history:
+        gesture_history.clear()
+        st.session_state.last_added_sign = ""
+        st.success("Sign history cleared!")
+
+    # Main layout
+    camera_col, chat_col = st.columns([2, 1])
+
+    # Camera feed
+    with camera_col:
+        st.subheader("📹 Camera Feed")
+        frame_placeholder = st.empty()
+        status_placeholder = st.empty()
+
+    # Detection panel
+    with chat_col:
+        st.subheader("🔤 Detected Signs")
+        chat_placeholder = st.empty()
+        
+        # Statistics
+        if gesture_history:
+            st.subheader("📊 Statistics")
+            sign_counts = {}
+            for sign in gesture_history:
+                sign_counts[sign] = sign_counts.get(sign, 0) + 1
+            
+            for sign, count in sorted(sign_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+                color = ALPHABET_COLOR_MAP.get(sign, "#FFFFFF")
+                st.markdown(f"<span style='color: {color}; font-weight: bold;'>{sign}</span>: {count}", unsafe_allow_html=True)
+
+    if run:
+        st.session_state.camera_active = True
+
+    if stop:
+        st.session_state.camera_active = False
+
+    # Main camera processing loop
+    if st.session_state.camera_active:
+        run_alphabet_detection(frame_placeholder, status_placeholder, chat_placeholder,
+                             confidence_threshold, tracking_confidence)
+    else:
+        status_placeholder.info("👆 Click 'Start Recognition' to begin ASL alphabet detection")
+        frame_placeholder.markdown("""
+            <div style='background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); 
+                        padding: 100px; text-align: center; border-radius: 15px;
+                        border: 2px dashed #ccc;'>
+                <h3 style='color: #666; margin: 0;'>📹 Camera Feed Will Appear Here</h3>
+                <p style='color: #888; margin: 10px 0 0 0;'>Start recognition to see live video</p>
+            </div>
+        """, unsafe_allow_html=True)
+
+with tab2:
+    st.markdown("### 🎓 **Alphabet Learning Mode**")
+    st.markdown("Learn ASL letters A-Z with ML-powered recognition feedback")
+    
+    # Initialize learning mode session state
+    if 'learning_mode' not in st.session_state:
+        st.session_state.learning_mode = {
+            'active': False,
+            'current_letter': 'A',
+            'score': 0,
+            'attempts': 0,
+            'completed_letters': set()
+        }
+    
+    # Learning mode controls
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        start_learning = st.button("🎯 Start Learning", type="primary", key="learning_start")
+    with col2:
+        stop_learning = st.button("⏹️ Stop Learning", key="learning_stop")  
+    with col3:
+        if st.button("🔄 Next Letter", key="next_letter"):
+            next_letter = chr(ord(st.session_state.learning_mode['current_letter']) + 1)
+            if next_letter <= 'Z':
+                st.session_state.learning_mode['current_letter'] = next_letter
+            else:
+                st.session_state.learning_mode['current_letter'] = 'A'
+    
+    if start_learning:
+        st.session_state.learning_mode['active'] = True
+    
+    if stop_learning:
+        st.session_state.learning_mode['active'] = False
+    
+    # Learning interface
+    learning_col1, learning_col2 = st.columns([2, 1])
+    
+    with learning_col1:
+        st.subheader("📹 Practice Area")
+        learning_frame_placeholder = st.empty()
+        learning_status_placeholder = st.empty()
+    
+    with learning_col2:
+        st.subheader("🎯 Current Challenge")
+        current_letter = st.session_state.learning_mode['current_letter']
+        
+        # Display current letter challenge
+        letter_color = ALPHABET_COLOR_MAP.get(current_letter, "#667eea")
+        st.markdown(f"""
+        <div style='background: linear-gradient(135deg, {letter_color} 0%, #764ba2 100%); 
+                    padding: 30px; border-radius: 15px; text-align: center; color: white; margin: 20px 0;'>
+            <h1 style='font-size: 5em; margin: 0; font-family: monospace; text-shadow: 2px 2px 4px rgba(0,0,0,0.3);'>{current_letter}</h1>
+            <p style='font-size: 1.2em; margin: 10px 0;'>Sign the letter <strong>{current_letter}</strong></p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Progress stats
+        learning_stats = st.session_state.learning_mode
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.metric("🏆 Score", learning_stats['score'])
+        with col_b:
+            st.metric("📝 Completed", len(learning_stats['completed_letters']))
+        
+        # Show completed letters
+        if learning_stats['completed_letters']:
+            st.subheader("✅ Completed Letters")
+            completed_display = " ".join(sorted(learning_stats['completed_letters']))
+            st.markdown(f"<div style='background: #e8f5e8; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 18px; text-align: center;'>{completed_display}</div>", unsafe_allow_html=True)
+        
+        # Feedback area
+        feedback_placeholder = st.empty()
+    
+    # Learning mode camera processing
+    if st.session_state.learning_mode['active']:
+        run_learning_camera(learning_frame_placeholder, learning_status_placeholder, feedback_placeholder,
+                           confidence_threshold, tracking_confidence)
+    else:
+        learning_status_placeholder.info("👆 Click 'Start Learning' to begin alphabet practice")
+        learning_frame_placeholder.markdown("""
+            <div style='background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); 
+                        padding: 100px; text-align: center; border-radius: 15px;
+                        border: 2px dashed #ccc;'>
+                <h3 style='color: #666; margin: 0;'>🎓 Learning Mode Camera</h3>
+                <p style='color: #888; margin: 10px 0 0 0;'>Practice ASL alphabet letters with ML feedback</p>
+            </div>
+        """, unsafe_allow_html=True)
+
+# Footer
+st.markdown("---")
+st.markdown(
+    """
+    <div style='text-align: center; color: #666; padding: 20px;'>
+        <p>🤖 Powered by MediaPipe & Machine Learning | 
+        🔤 Supports A-Z + Thank You | 
+        🎯 Real-time ML Recognition</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
